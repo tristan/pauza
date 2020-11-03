@@ -23,16 +23,34 @@ pub fn get_idle_time() -> Result<Duration, i32> {
 // WINDOWS GUI
 
 use nwg::NativeUi;
+use std::thread;
+use crossbeam::channel::{unbounded, Receiver, TryRecvError};
+use crate::Event;
+use std::rc::Rc;
 
-#[derive(Default)]
 pub struct BasicApp {
     window: nwg::Window,
     label: nwg::Label,
     icon: nwg::Icon,
     tray: nwg::TrayNotification,
+    notice: nwg::Notice,
+
+    r: Receiver<Event>
 }
 
 impl BasicApp {
+
+    fn new(r: Receiver<Event>) -> BasicApp {
+        BasicApp {
+            window: nwg::Window::default(),
+            label: nwg::Label::default(),
+            icon: nwg::Icon::default(),
+            tray: nwg::TrayNotification::default(),
+            notice: nwg::Notice::default(),
+            r
+        }
+    }
+
     fn reset_notification(&self) {
         let flags = nwg::TrayNotificationFlags::USER_ICON
             | nwg::TrayNotificationFlags::LARGE_ICON;
@@ -50,11 +68,36 @@ impl BasicApp {
                        Some(flags),
                        Some(&self.icon));
     }
+
+    fn on_timer_tick(&self) {
+        loop {
+            match self.r.try_recv() {
+                Ok(event) => match event {
+                    Event::UpdateTime(duration) => {
+                        let text = format!("{:?}", duration);
+                        self.label.set_text(&text);
+                    },
+                    Event::NotifyReset => {
+                        self.reset_notification();
+                    },
+                    Event::NotifyBreak => {
+                        self.break_notification();
+                    }
+                },
+                Err(TryRecvError::Empty) => {
+                    break;
+                },
+                Err(e) => {
+                    println!("ERROR: {}", e);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 mod basic_app_ui {
     use super::*;
-    use std::rc::Rc;
     use std::cell::RefCell;
     use std::ops::Deref;
 
@@ -81,7 +124,6 @@ mod basic_app_ui {
 
             nwg::Label::builder()
                 .text("Starting...")
-                //.font(Some(font))
                 .parent(&data.window)
                 .build(&mut data.label)?;
 
@@ -90,6 +132,10 @@ mod basic_app_ui {
                 .icon(Some(&data.icon))
                 .tip(Some("Pauza"))
                 .build(&mut data.tray)?;
+
+            nwg::Notice::builder()
+                .parent(&data.window)
+                .build(&mut data.notice)?;
 
             // Wrap-up
             let ui = BasicAppUi {
@@ -104,6 +150,9 @@ mod basic_app_ui {
                     match evt {
                         E::OnWindowClose => if &handle == &ui.window {
                             nwg::stop_thread_dispatch();
+                        },
+                        E::OnNotice => {
+                            ui.on_timer_tick();
                         },
                         _ => {}
                     }
@@ -135,28 +184,28 @@ mod basic_app_ui {
     }
 }
 
-pub fn start(r: crossbeam::channel::Receiver<crate::Event>) {
+pub fn start(r: Receiver<Event>) {
     nwg::init().expect("Failed to init Native Windows GUI");
     nwg::Font::set_global_family("Segoe UI").expect("Failed to set default font");
-    let ui = BasicApp::build_ui(Default::default()).expect("Failed to build UI");
-    nwg::dispatch_thread_events_with_callback(move || {
-        match r.try_recv() {
-            Ok(event) => match event {
-                crate::Event::UpdateTime(duration) => {
-                    let text = format!("{:?}", duration);
-                    ui.label.set_text(&text);
+
+    let (uis, uir) = unbounded();
+    let ui = BasicApp::build_ui(BasicApp::new(uir)).expect("Failed to build UI");
+
+    let notice = &ui.notice;
+    let sender = notice.sender();
+    thread::spawn(move || {
+        loop {
+            match r.recv() {
+                Ok(event) => {
+                    uis.send(event).unwrap();
+                    sender.notice();
                 },
-                crate::Event::NotifyReset => {
-                    ui.reset_notification();
-                },
-                crate::Event::NotifyBreak => {
-                    ui.break_notification();
+                Err(_e) => {
+                    break;
                 }
-            },
-            Err(crossbeam::channel::TryRecvError::Empty) => {},
-            Err(e) => {
-                println!("ERROR: {}", e);
             }
         }
     });
+
+    nwg::dispatch_thread_events();
 }
